@@ -1,0 +1,1 @@
+-- Intentionally empty. Security test fixtures are transaction-scoped.

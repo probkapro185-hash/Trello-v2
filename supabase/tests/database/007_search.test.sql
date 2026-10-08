@@ -1,0 +1,57 @@
+begin;
+create extension if not exists pgtap with schema extensions;
+set local search_path=public,extensions;
+select no_plan();
+insert into auth.users(id,email) values('80000000-0000-0000-0000-000000000001','search-owner@example.test'),('80000000-0000-0000-0000-000000000002','search-outsider@example.test');
+insert into public.profiles(id,name,username) values('80000000-0000-0000-0000-000000000001','Owner','search_test_owner'),('80000000-0000-0000-0000-000000000002','Outsider','search_test_outsider');
+insert into public.workspaces(id,name,owner_id) values('80000000-0000-0000-0000-000000000010','Search','80000000-0000-0000-0000-000000000001');
+insert into public.boards(id,workspace_id,name) values('80000000-0000-0000-0000-000000000020','80000000-0000-0000-0000-000000000010','Test');
+insert into public.tasks(id,workspace_id,board_id,column_id,title,description)
+ select '80000000-0000-0000-0000-000000000030',workspace_id,board_id,id,'Проверить релиз','Секретное описание aurorabrief' from public.columns where board_id='80000000-0000-0000-0000-000000000020' and name='TODO';
+insert into public.task_assignees(task_id,user_id,workspace_id,board_id) values('80000000-0000-0000-0000-000000000030','80000000-0000-0000-0000-000000000001','80000000-0000-0000-0000-000000000010','80000000-0000-0000-0000-000000000020');
+select ok(not has_function_privilege('anon','public.search_tasks(text,integer)','EXECUTE'),'anonymous search denied');
+select ok(not has_function_privilege('anon','public.my_tasks(boolean,integer)','EXECUTE'),'anonymous assignments denied');
+select ok(not (select prosecdef from pg_proc where oid='public.search_tasks(text,integer)'::regprocedure),'search uses invoker rights');
+select ok(not (select prosecdef from pg_proc where oid='public.my_tasks(boolean,integer)'::regprocedure),'my tasks uses invoker rights');
+set local role authenticated;
+select set_config('request.jwt.claim.sub','80000000-0000-0000-0000-000000000001',true);
+select is((select count(*) from public.search_tasks('РЕЛИЗ')),1::bigint,'Russian title case-insensitive search');
+select is((select count(*) from public.search_tasks('aurorabrief')),1::bigint,'description search');
+select is((select count(*) from public.search_tasks('"Проверить релиз"')),1::bigint,'quoted phrase search');
+select is((select count(*) from public.search_tasks('')),0::bigint,'empty search does not dump tasks');
+select is((select count(*) from public.search_tasks(repeat('x',201))),0::bigint,'oversized search rejected');
+select lives_ok($$select * from public.search_tasks('" ) & | : *')$$,'malformed query is safe');
+select is((select count(*) from public.my_tasks()),1::bigint,'own assigned task shown');
+select is((select count(*) from public.my_tasks(true)),0::bigint,'open task not completed');
+select set_config('request.jwt.claim.sub','80000000-0000-0000-0000-000000000002',true);
+select is((select count(*) from public.search_tasks('aurorabrief')),0::bigint,'outsider cannot search private description');
+select is((select count(*) from public.my_tasks()),0::bigint,'outsider cannot read others assignments');
+reset role;
+-- A column's completion flag is authoritative even when its name is arbitrary.
+update public.columns set is_done=true,name='Delivered' where board_id='80000000-0000-0000-0000-000000000020' and name='TODO';
+set local role authenticated;
+select set_config('request.jwt.claim.sub','80000000-0000-0000-0000-000000000001',true);
+select is((select count(*) from public.my_tasks()),0::bigint,'completed tasks excluded from active list');
+select is((select count(*) from public.my_tasks(true)),1::bigint,'completion uses column flag');
+reset role;
+insert into public.tasks(workspace_id,board_id,column_id,title)
+ select c.workspace_id,c.board_id,c.id,'paginationprobe '||n from public.columns c cross join generate_series(1,65) n where c.board_id='80000000-0000-0000-0000-000000000020' and c.name='Delivered';
+set local role authenticated;
+select is((select count(*) from public.search_tasks('paginationprobe',0)),31::bigint,'search returns one lookahead row');
+select is((select count(*) from public.search_tasks('paginationprobe',2)),5::bigint,'last page is bounded');
+select is((select count(*) from (select id from public.search_tasks('paginationprobe',0) limit 30) a join (select id from public.search_tasks('paginationprobe',1) limit 30) b using(id)),0::bigint,'stable pages do not overlap');
+reset role;
+-- Even assigned rows disappear when membership is removed.
+insert into public.workspace_members(workspace_id,user_id) values('80000000-0000-0000-0000-000000000010','80000000-0000-0000-0000-000000000002');
+insert into public.task_assignees(task_id,user_id,workspace_id,board_id) values('80000000-0000-0000-0000-000000000030','80000000-0000-0000-0000-000000000002','80000000-0000-0000-0000-000000000010','80000000-0000-0000-0000-000000000020');
+set local role authenticated;
+select set_config('request.jwt.claim.sub','80000000-0000-0000-0000-000000000002',true);
+select is((select count(*) from public.my_tasks(true)),1::bigint,'member sees own assignment');
+reset role;
+delete from public.workspace_members where workspace_id='80000000-0000-0000-0000-000000000010' and user_id='80000000-0000-0000-0000-000000000002';
+set local role authenticated;
+select is((select count(*) from public.my_tasks(true)),0::bigint,'membership removal revokes my tasks');
+select is((select count(*) from public.search_tasks('aurorabrief')),0::bigint,'membership removal revokes search');
+reset role;
+select * from finish();
+rollback;

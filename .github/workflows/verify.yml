@@ -1,0 +1,38 @@
+name: Verify Contour
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Start disposable local database
+        run: npm run db:start > /tmp/contour-db-start.log 2>&1
+      - name: Configure local public environment without logging credentials
+        run: |
+          node --input-type=module <<'JS'
+          import {execFileSync} from 'node:child_process';
+          import {writeFileSync} from 'node:fs';
+          const s=JSON.parse(execFileSync('npx',['supabase','status','-o','json'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}));
+          writeFileSync('.env.local',`NEXT_PUBLIC_SUPABASE_URL=${s.API_URL}\nNEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${s.ANON_KEY}\nNEXT_PUBLIC_APP_URL=http://localhost:3000\n`,{mode:0o600});
+          JS
+      - run: npm run check
+      - run: npm run test:tasks && npm run test:production
+      - run: npm run db:test && npm run db:lint
+      - run: npm run db:test:realtime && npm run db:test:collaboration && npm run db:test:invite-race
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Verify generated schema types
+        run: npm run db:types && git diff --exit-code -- src/types/database.ts
+      - name: Stop local services
+        if: always()
+        run: npm run db:stop
